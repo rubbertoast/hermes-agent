@@ -17,6 +17,8 @@ import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from multidict import CIMultiDict
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
@@ -249,6 +251,33 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+# ---------------------------------------------------------------------------
+# Body limit middleware
+# ---------------------------------------------------------------------------
+
+
+class TestBodyLimitMiddleware:
+    @pytest.mark.asyncio
+    async def test_http_request_entity_too_large_returns_json_413_with_security_headers(self):
+        adapter = _make_adapter()
+        adapter._max_request_bytes = 64
+        request = MagicMock()
+        request.method = "POST"
+        request.headers = CIMultiDict()
+        request.app = {"api_server_adapter": adapter}
+
+        async def handler(_request):
+            raise web.HTTPRequestEntityTooLarge(max_size=adapter._max_request_bytes, actual_size=128)
+
+        resp = await body_limit_middleware(request, handler)
+        assert resp.status == 413
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+        assert resp.headers.get("Referrer-Policy") == "no-referrer"
+        payload = json.loads(resp.text)
+        assert payload["error"]["code"] == "body_too_large"
+        assert str(adapter._max_request_bytes) in payload["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +943,24 @@ class TestDeriveChatSessionId:
 
 
 class TestResponsesEndpoint:
+    @pytest.mark.asyncio
+    async def test_request_body_over_limit_returns_413_with_limit_details(self):
+        adapter = _make_adapter()
+        adapter._max_request_bytes = 64
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                data="x" * 65,
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 413
+            assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+            assert resp.headers.get("Referrer-Policy") == "no-referrer"
+            data = await resp.json()
+            assert data["error"]["code"] == "body_too_large"
+            assert str(adapter._max_request_bytes) in data["error"]["message"]
+
     @pytest.mark.asyncio
     async def test_missing_input_returns_400(self, adapter):
         app = _create_app(adapter)
