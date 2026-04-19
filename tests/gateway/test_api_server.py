@@ -27,6 +27,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _CORS_HEADERS,
     _derive_chat_session_id,
+    body_limit_middleware,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -126,6 +127,7 @@ class TestAdapterInit:
                 "port": 9999,
                 "key": "sk-test",
                 "cors_origins": ["http://localhost:3000"],
+                "max_request_bytes": 2_500_000,
             },
         )
         adapter = APIServerAdapter(config)
@@ -133,12 +135,14 @@ class TestAdapterInit:
         assert adapter._port == 9999
         assert adapter._api_key == "sk-test"
         assert adapter._cors_origins == ("http://localhost:3000",)
+        assert adapter._max_request_bytes == 2_500_000
 
     def test_config_from_env(self, monkeypatch):
         monkeypatch.setenv("API_SERVER_HOST", "10.0.0.1")
         monkeypatch.setenv("API_SERVER_PORT", "7777")
         monkeypatch.setenv("API_SERVER_KEY", "sk-env")
         monkeypatch.setenv("API_SERVER_CORS_ORIGINS", "http://localhost:3000, http://127.0.0.1:3000")
+        monkeypatch.setenv("API_SERVER_MAX_REQUEST_BYTES", "3000000")
         config = PlatformConfig(enabled=True)
         adapter = APIServerAdapter(config)
         assert adapter._host == "10.0.0.1"
@@ -148,6 +152,13 @@ class TestAdapterInit:
             "http://localhost:3000",
             "http://127.0.0.1:3000",
         )
+        assert adapter._max_request_bytes == 3_000_000
+
+    @pytest.mark.parametrize("raw_value", ["0", "-1", "not-a-number", "   "])
+    def test_invalid_max_request_bytes_falls_back_to_default(self, raw_value):
+        config = PlatformConfig(enabled=True, extra={"max_request_bytes": raw_value})
+        adapter = APIServerAdapter(config)
+        assert adapter._max_request_bytes == 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +227,8 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
-    app = web.Application(middlewares=mws)
+    mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=mws, client_max_size=adapter._max_request_bytes)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
@@ -406,6 +417,39 @@ class TestModelsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_request_body_over_limit_returns_413_with_limit_details(self):
+        adapter = _make_adapter()
+        adapter._max_request_bytes = 64
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                data="x" * 65,
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 413
+            assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+            assert resp.headers.get("Referrer-Policy") == "no-referrer"
+            data = await resp.json()
+            assert data["error"]["code"] == "body_too_large"
+            assert str(adapter._max_request_bytes) in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_request_body_over_custom_limit_uses_adapter_setting(self):
+        adapter = _make_adapter()
+        adapter._max_request_bytes = 128
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                data="x" * 129,
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 413
+            data = await resp.json()
+            assert "128" in data["error"]["message"]
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
