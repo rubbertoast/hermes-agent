@@ -264,16 +264,24 @@ else:
     cors_middleware = None  # type: ignore[assignment]
 
 
-def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
+def _openai_error(
+    message: str,
+    err_type: str = "invalid_request_error",
+    param: str = None,
+    code: str = None,
+    request_id: str = None,
+) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
-    return {
-        "error": {
-            "message": message,
-            "type": err_type,
-            "param": param,
-            "code": code,
-        }
+    error = {
+        "message": message,
+        "type": err_type,
+        "param": param,
+        "code": code,
     }
+    normalized_request_id = _normalize_request_id(request_id)
+    if normalized_request_id:
+        error["request_id"] = normalized_request_id
+    return {"error": error}
 
 
 def _parse_positive_int(value: Any, default: int) -> int:
@@ -568,8 +576,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
 
+        request_id = _get_request_id(request)
+        logger.warning("[api_server][request_id=%s] Invalid API key", request_id)
         return web.json_response(
-            {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+            _openai_error("Invalid API key", code="invalid_api_key", request_id=request_id),
             status=401,
         )
 
@@ -599,6 +609,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -646,6 +657,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
+        if request_id:
+            agent.request_id = request_id
         return agent
 
     # ------------------------------------------------------------------
@@ -703,6 +716,7 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        request_id = _get_request_id(request)
 
         # Parse request body
         try:
@@ -872,6 +886,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                request_id=request_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -880,18 +895,18 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                logger.error("[api_server][request_id=%s] Error running agent for chat completions: %s", request_id, e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(f"Internal server error: {e}", err_type="server_error", request_id=request_id),
                     status=500,
                 )
         else:
             try:
                 result, usage = await _compute_completion()
             except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                logger.error("[api_server][request_id=%s] Error running agent for chat completions: %s", request_id, e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(f"Internal server error: {e}", err_type="server_error", request_id=request_id),
                     status=500,
                 )
 
@@ -1484,13 +1499,14 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        request_id = _get_request_id(request)
 
         # Parse request body
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
             return web.json_response(
-                {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
+                _openai_error("Invalid JSON in request body", request_id=request_id),
                 status=400,
             )
 
@@ -1657,6 +1673,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                request_id=request_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1668,18 +1685,18 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
             except Exception as e:
-                logger.error("Error running agent for responses: %s", e, exc_info=True)
+                logger.error("[api_server][request_id=%s] Error running agent for responses: %s", request_id, e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(f"Internal server error: {e}", err_type="server_error", request_id=request_id),
                     status=500,
                 )
         else:
             try:
                 result, usage = await _compute_response()
             except Exception as e:
-                logger.error("Error running agent for responses: %s", e, exc_info=True)
+                logger.error("[api_server][request_id=%s] Error running agent for responses: %s", request_id, e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(f"Internal server error: {e}", err_type="server_error", request_id=request_id),
                     status=500,
                 )
 
@@ -2077,6 +2094,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -2100,6 +2118,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
+                request_id=request_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
@@ -2277,6 +2296,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
+                    request_id=request_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )
@@ -2304,7 +2324,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "usage": usage,
                 })
             except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
+                logger.exception("[api_server][request_id=%s] run %s failed", request_id, run_id)
                 try:
                     q.put_nowait({
                         "event": "run.failed",

@@ -842,10 +842,12 @@ class TestChatCompletionsEndpoint:
         """Agent exception returns 500."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(api_server_module, "logger") as mock_logger:
                 mock_run.side_effect = RuntimeError("Provider failed")
                 resp = await cli.post(
                     "/v1/chat/completions",
+                    headers={"X-Request-ID": "req-provider-789"},
                     json={
                         "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "Hello"}],
@@ -855,6 +857,10 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 500
             data = await resp.json()
             assert "Provider failed" in data["error"]["message"]
+            assert data["error"]["request_id"] == "req-provider-789"
+            assert resp.headers.get("X-Request-ID") == "req-provider-789"
+            logged_args = " ".join(str(arg) for arg in mock_logger.error.call_args[0])
+            assert "req-provider-789" in logged_args
 
     @pytest.mark.asyncio
     async def test_stable_session_id_across_turns(self, adapter):
@@ -2229,6 +2235,8 @@ class TestRequestIdTracking:
 
             assert resp.status == 401
             assert resp.headers.get("X-Request-ID")
+            data = await resp.json()
+            assert data["error"]["request_id"] == resp.headers.get("X-Request-ID")
 
     @pytest.mark.asyncio
     async def test_run_events_include_request_id_and_response_header(self, auth_adapter):
