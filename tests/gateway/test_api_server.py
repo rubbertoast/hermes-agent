@@ -24,6 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+import gateway.platforms.api_server as api_server_module
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
@@ -229,7 +230,16 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+    mws = [
+        mw
+        for mw in (
+            getattr(api_server_module, "request_id_middleware", None),
+            cors_middleware,
+            body_limit_middleware,
+            security_headers_middleware,
+        )
+        if mw is not None
+    ]
     app = web.Application(middlewares=mws, client_max_size=adapter._max_request_bytes)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
@@ -240,6 +250,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     return app
 
 
@@ -2182,3 +2194,73 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# X-Request-ID header (request correlation)
+# ---------------------------------------------------------------------------
+
+
+class TestRequestIdTracking:
+    @pytest.mark.asyncio
+    async def test_chat_completion_echoes_supplied_request_id_header(self, adapter):
+        mock_result = {"final_response": "Hello!", "messages": [], "api_calls": 1}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Request-ID": "req-chat-123"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                )
+
+            assert resp.status == 200
+            assert resp.headers.get("X-Request-ID") == "req-chat-123"
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_returns_generated_request_id_header(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+
+            assert resp.status == 401
+            assert resp.headers.get("X-Request-ID")
+
+    @pytest.mark.asyncio
+    async def test_run_events_include_request_id_and_response_header(self, auth_adapter):
+        class _FakeAgent:
+            def __init__(self, tool_progress_callback=None):
+                self._tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, user_message, conversation_history=None, task_id=None):
+                if self._tool_progress_callback:
+                    self._tool_progress_callback("tool.started", tool_name="search_files", preview="trace request")
+                return {"final_response": "done", "messages": []}
+
+        def _fake_create_agent(*args, **kwargs):
+            return _FakeAgent(tool_progress_callback=kwargs.get("tool_progress_callback"))
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent", side_effect=_fake_create_agent):
+                start = await cli.post(
+                    "/v1/runs",
+                    headers={"Authorization": "Bearer sk-secret", "X-Request-ID": "req-run-456"},
+                    json={"input": "Check latest SEO request"},
+                )
+                assert start.status == 202
+                assert start.headers.get("X-Request-ID") == "req-run-456"
+                payload = await start.json()
+                run_id = payload["run_id"]
+
+                events = await cli.get(
+                    f"/v1/runs/{run_id}/events",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert events.status == 200
+                body = await events.text()
+                assert '"request_id": "req-run-456"' in body

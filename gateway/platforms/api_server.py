@@ -235,7 +235,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Request-ID",
 }
 
 
@@ -296,6 +296,37 @@ def _request_body_too_large_message(limit_bytes: int, actual_bytes: Optional[int
     return (
         f"{base}. For larger multi-turn conversations, prefer /v1/responses with previous_response_id or conversation chaining."
     )
+
+
+def _normalize_request_id(value: Any) -> str:
+    """Return a safe request ID suitable for headers, logs, and event payloads."""
+    request_id = str(value or "").strip()
+    if not request_id:
+        return ""
+    if len(request_id) > 200:
+        return ""
+    if re.search(r"[\r\n\x00]", request_id):
+        return ""
+    return request_id
+
+
+def _get_request_id(request: "web.Request") -> str:
+    """Read the correlation ID assigned by middleware, or generate a fallback."""
+    request_id = _normalize_request_id(request.get("request_id", ""))
+    return request_id or f"req_{uuid.uuid4().hex}"
+
+
+if AIOHTTP_AVAILABLE:
+    @web.middleware
+    async def request_id_middleware(request, handler):
+        """Assign and propagate a stable request correlation ID for every API request."""
+        request_id = _normalize_request_id(request.headers.get("X-Request-ID", "")) or f"req_{uuid.uuid4().hex}"
+        request["request_id"] = request_id
+        response = await handler(request)
+        response.headers.setdefault("X-Request-ID", request_id)
+        return response
+else:
+    request_id_middleware = None  # type: ignore[assignment]
 
 
 if AIOHTTP_AVAILABLE:
@@ -890,7 +921,8 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        headers = {"X-Hermes-Session-Id": session_id, "X-Request-ID": _get_request_id(request)}
+        return web.json_response(response_data, headers=headers)
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -917,6 +949,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers.update(cors)
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
+        sse_headers["X-Request-ID"] = _get_request_id(request)
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
@@ -1079,6 +1112,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers.update(cors)
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
+        sse_headers["X-Request-ID"] = _get_request_id(request)
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
@@ -1691,13 +1725,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": session_id,
+                "request_id": _get_request_id(request),
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
-        return web.json_response(response_data)
+        return web.json_response(response_data, headers={"X-Request-ID": _get_request_id(request)})
 
     # ------------------------------------------------------------------
     # GET / DELETE response endpoints
@@ -2093,7 +2128,7 @@ class APIServerAdapter(BasePlatformAdapter):
     _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", request_id: str):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
             q = self._run_streams.get(run_id)
@@ -2110,6 +2145,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
+                    "request_id": request_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
@@ -2118,6 +2154,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
+                    "request_id": request_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
@@ -2127,6 +2164,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _push({
                     "event": "reasoning.available",
                     "run_id": run_id,
+                    "request_id": request_id,
                     "timestamp": ts,
                     "text": preview or "",
                 })
@@ -2161,12 +2199,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        request_id = _get_request_id(request)
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = time.time()
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(run_id, loop, request_id)
 
         # Also wire stream_delta_callback so message.delta events flow through
         def _text_cb(delta: Optional[str]) -> None:
@@ -2176,6 +2215,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 loop.call_soon_threadsafe(q.put_nowait, {
                     "event": "message.delta",
                     "run_id": run_id,
+                    "request_id": request_id,
                     "timestamp": time.time(),
                     "delta": delta,
                 })
@@ -2258,6 +2298,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 q.put_nowait({
                     "event": "run.completed",
                     "run_id": run_id,
+                    "request_id": request_id,
                     "timestamp": time.time(),
                     "output": final_response,
                     "usage": usage,
@@ -2268,6 +2309,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     q.put_nowait({
                         "event": "run.failed",
                         "run_id": run_id,
+                        "request_id": request_id,
                         "timestamp": time.time(),
                         "error": str(exc),
                     })
@@ -2288,7 +2330,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+        return web.json_response({"run_id": run_id, "status": "started"}, status=202, headers={"X-Request-ID": request_id})
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -2365,7 +2407,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [mw for mw in (request_id_middleware, cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws, client_max_size=self._max_request_bytes)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
